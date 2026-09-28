@@ -34,11 +34,10 @@ func TestNormalizeOptions(t *testing.T) {
 	}
 }
 
-// TestNormalizeOptionsAlwaysEnablesHostAccess 验证显式 false 不再恢复已移除的宿主访问安全策略。
+// TestNormalizeOptionsDefaultsHostAccess 验证未显式配置时保留旧版宿主访问行为。
 //
-// 三个 Allow 字段仅保留源码兼容，所有 State 规范化后都必须允许访问对应宿主能力。
-func TestNormalizeOptionsAlwaysEnablesHostAccess(t *testing.T) {
-	// 使用三个字段的零值模拟旧调用方显式或隐式关闭权限的配置。
+// 未设置 AllowProcessSet 的旧调用方仍默认允许进程能力。
+func TestNormalizeOptionsDefaultsHostAccess(t *testing.T) {
 	options := NormalizeOptions(Options{
 		AllowHostFilesystem: false,
 		AllowEnvironment:    false,
@@ -48,6 +47,21 @@ func TestNormalizeOptionsAlwaysEnablesHostAccess(t *testing.T) {
 	if !options.AllowHostFilesystem || !options.AllowEnvironment || !options.AllowProcess {
 		// 任一能力仍关闭都表示旧安全策略尚未完整移除。
 		t.Fatalf("normalized host access should always be enabled: %#v", options)
+	}
+}
+
+func TestNormalizeOptionsPreservesExplicitProcessDenial(t *testing.T) {
+	options := NormalizeOptions(Options{}.WithProcessAccess(false))
+	if options.AllowProcess {
+		t.Fatalf("explicit process denial was overwritten: %#v", options)
+	}
+	if !options.AllowProcessSet {
+		t.Fatalf("explicit process setting was lost: %#v", options)
+	}
+
+	state := NewStateWithOptions(Options{}.WithProcessAccess(false))
+	if state.Options().AllowProcess {
+		t.Fatalf("state unexpectedly allows host processes: %#v", state.Options())
 	}
 }
 

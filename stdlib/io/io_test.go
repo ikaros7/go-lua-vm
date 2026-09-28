@@ -1240,3 +1240,10 @@ func TestFilesystemAccessAndProcessPolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestPOpenWithOptionsDeniesExplicitlyDisabledProcess(t *testing.T) {
+	options := runtime.Options{}.WithProcessAccess(false)
+	if _, err := POpenWithOptions(options, runtime.StringValue("exit 0"), runtime.StringValue("r")); !errors.Is(err, runtime.ErrLuaError) {
+		t.Fatalf("POpenWithOptions disabled error = %v, want Lua error", err)
+	}
+}

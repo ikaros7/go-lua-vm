@@ -209,6 +209,17 @@ func TestExecuteRunsHostShell(t *testing.T) {
 	}
 }
 
+func TestExecuteWithOptionsDeniesExplicitlyDisabledProcess(t *testing.T) {
+	options := runtime.Options{}.WithProcessAccess(false)
+	if _, err := ExecuteWithOptions(options, runtime.StringValue("exit 0")); !errors.Is(err, runtime.ErrLuaError) {
+		t.Fatalf("ExecuteWithOptions disabled error = %v, want Lua error", err)
+	}
+	values, err := ExecuteWithOptions(options)
+	if err != nil || len(values) != 1 || values[0].Kind != runtime.KindBoolean || values[0].Bool {
+		t.Fatalf("disabled shell query = %#v, %v; want false", values, err)
+	}
+}
+
 // TestExitReturnsStructuredLuaError 验证 os.exit 在嵌入模式下不终止宿主进程。
 //
 // 当前实现通过 Lua error 包装 ExitError，后续 CLI 层可用 errors.As 提取退出码。
