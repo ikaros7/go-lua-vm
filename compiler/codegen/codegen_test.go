@@ -108,6 +108,24 @@ return x
 	}
 }
 
+func TestCompileChunkReleasesCallsInLargeTableConstructor(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("local function value(v) return v end\nlocal mapping = {\n")
+	for index := 0; index < 256; index++ {
+		fmt.Fprintf(&source, "[value(%d)] = value(%d),\n", index, 255-index)
+	}
+	source.WriteString("}\nreturn mapping\n")
+
+	chunk := parseChunkForCodegenTest(t, source.String())
+	proto, err := CompileChunk(chunk, "large-table-calls")
+	if err != nil {
+		t.Fatalf("compile large table failed: %v", err)
+	}
+	if proto.MaxStackSize > 8 {
+		t.Fatalf("table calls leaked temporary registers: max stack=%d", proto.MaxStackSize)
+	}
+}
+
 // TestCompileChunkReleasesOpenArgumentCallAfterFixedResult 验证开放实参固定单返回 CALL 后回收参数槽。
 //
 // `string.len(string.sub(...))` 会生成外层 CALL B=0/C=2；CALL 完成后仍只有一个固定返回值，

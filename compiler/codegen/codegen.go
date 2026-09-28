@@ -4573,6 +4573,9 @@ func (generator *generator) compileTableConstructorTo(expression *parser.TableCo
 			generator.releaseRegister(valueRegister)
 			return err
 		}
+		if expressionIsFixedSingleResultCall(fieldExpression) {
+			generator.releaseCallArgumentsAfterFixedResult(valueRegister, 1)
+		}
 		keyIndex := generator.addConstant(bytecode.IntegerConstant(int64(fieldIndex + 1)))
 		keyOperand, keyRegister, err := generator.rkOperandForConstantIndex(keyIndex)
 		if err != nil {
@@ -4593,6 +4596,9 @@ recordFields:
 			generator.releaseRegister(valueRegister)
 			return err
 		}
+		if expressionIsFixedSingleResultCall(recordField.Value) {
+			generator.releaseCallArgumentsAfterFixedResult(valueRegister, 1)
+		}
 		keyIndex := generator.addConstant(bytecode.StringConstant(recordField.Name))
 		keyOperand, keyRegister, err := generator.rkOperandForConstantIndex(keyIndex)
 		if err != nil {
@@ -4612,12 +4618,18 @@ recordFields:
 			generator.releaseRegister(keyRegister)
 			return err
 		}
+		if expressionIsFixedSingleResultCall(indexField.Key) {
+			generator.releaseCallArgumentsAfterFixedResult(keyRegister, 1)
+		}
 		valueRegister := generator.allocateRegister()
 		if err := generator.compileExpressionTo(indexField.Value, valueRegister); err != nil {
 			// value 表达式失败时释放两个临时寄存器。
 			generator.releaseRegister(valueRegister)
 			generator.releaseRegister(keyRegister)
 			return err
+		}
+		if expressionIsFixedSingleResultCall(indexField.Value) {
+			generator.releaseCallArgumentsAfterFixedResult(valueRegister, 1)
 		}
 		generator.emitABC(bytecode.OpSetTable, targetRegister, keyRegister, valueRegister)
 		generator.releaseRegister(valueRegister)

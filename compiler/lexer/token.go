@@ -72,7 +72,7 @@ func (lexer *Lexer) NextToken() Token {
 			return token
 		}
 	}
-	if isIdentifierStartByte(firstByte) {
+	if isIdentifierStartByte(firstByte) || firstByte >= 0x80 && lexer.canStartUnicodeIdentifier() {
 		// 标识符和关键字共用标识符扫描路径。
 		if token, ok := lexer.scanIdentifierOrKeywordToken(); ok {
 			return token
@@ -91,6 +91,11 @@ func (lexer *Lexer) NextToken() Token {
 		Position: position,
 		Err:      fmt.Errorf("illegal character %q", illegalRune),
 	}
+}
+
+func (lexer *Lexer) canStartUnicodeIdentifier() bool {
+	firstRune, ok := lexer.source.Peek()
+	return ok && isIdentifierStart(firstRune)
 }
 
 // canStartStringToken 判断当前位置是否可能开启 Lua 字符串 token。

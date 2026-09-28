@@ -544,19 +544,16 @@ func TestLexerScanIdentifier(t *testing.T) {
 	}
 }
 
-// TestLexerScanIdentifierStopsBeforeNonASCII 验证标识符扫描不会吞掉后续非 ASCII 字符。
-//
-// 当前标识符限定 ASCII；非 ASCII 字符必须留给普通非法 token 路径按完整 UTF-8 rune 消费。
-func TestLexerScanIdentifierStopsBeforeNonASCII(t *testing.T) {
-	lexer := New("abc界")
+// TestLexerScanIdentifierAcceptsUnicode 验证宿主扩展可直接使用中文标识符。
+func TestLexerScanIdentifierAcceptsUnicode(t *testing.T) {
+	lexer := New("abc界_面2 +")
 
 	identifier, position, ok := lexer.ScanIdentifier()
 	if !ok {
 		// 输入以 ASCII 字母开头，必须先识别前缀标识符。
 		t.Fatalf("expected identifier")
 	}
-	if identifier != "abc" {
-		// 标识符扫描必须停在第一个非 ASCII 字节之前。
+	if identifier != "abc界_面2" {
 		t.Fatalf("unexpected identifier=%q", identifier)
 	}
 	if position.Line != 1 || position.Column != 1 || position.Offset != 0 {
@@ -565,25 +562,29 @@ func TestLexerScanIdentifierStopsBeforeNonASCII(t *testing.T) {
 	}
 
 	currentPosition := lexer.source.Position()
-	if currentPosition.Line != 1 || currentPosition.Column != 4 || currentPosition.Offset != 3 {
-		// 三个 ASCII 字符消费后，列号推进 3，字节偏移也推进 3。
+	if currentPosition.Line != 1 || currentPosition.Column != 8 || currentPosition.Offset != len("abc界_面2") {
 		t.Fatalf("unexpected current position=%+v", currentPosition)
 	}
 
 	nextRune, ok := lexer.PeekRune()
 	if !ok {
-		// 非 ASCII 字符仍在输入中，不能被标识符扫描消费。
-		t.Fatalf("expected remaining non-ascii rune")
+		t.Fatalf("expected remaining input")
 	}
-	if nextRune != '界' {
-		// 后续读取必须仍能看到完整 UTF-8 rune，而不是单个残留字节。
+	if nextRune != ' ' {
 		t.Fatalf("unexpected next rune=%q", nextRune)
 	}
 
 	token := lexer.NextToken()
-	if token.Kind != TokenIllegal || token.Text != "界" {
-		// 非 ASCII 标识符后缀继续走普通非法 token 路径，保持错误语义。
+	if token.Kind != TokenOperator || token.Text != "+" {
 		t.Fatalf("unexpected token after identifier: kind=%s text=%q err=%v", token.Kind, token.Text, token.Err)
+	}
+}
+
+func TestLexerNextTokenStartsWithUnicodeIdentifier(t *testing.T) {
+	lexer := New("登录状态 = true")
+	token := lexer.NextToken()
+	if token.Kind != TokenIdentifier || token.Text != "登录状态" {
+		t.Fatalf("unexpected unicode identifier: kind=%s text=%q err=%v", token.Kind, token.Text, token.Err)
 	}
 }
 

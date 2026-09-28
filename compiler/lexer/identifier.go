@@ -1,9 +1,11 @@
 package lexer
 
+import "unicode"
+
 // ScanIdentifier 尝试读取当前位置的 Lua 标识符。
 //
-// Lua 5.3 标识符由 ASCII 字母或下划线开头，后续可包含 ASCII 字母、数字或下划线；
-// 关键字分类会在后续 TODO 中单独处理。
+// Lua 5.3 itself commonly uses locale-dependent identifiers. This lexer also
+// accepts Unicode letters so hosts such as LazyElf can use Chinese names.
 func (lexer *Lexer) ScanIdentifier() (string, Position, bool) {
 	startPosition := lexer.source.Position()
 	input := lexer.source.input
@@ -12,22 +14,22 @@ func (lexer *Lexer) ScanIdentifier() (string, Position, bool) {
 		// EOF 不能形成标识符。
 		return "", startPosition, false
 	}
-	if !isIdentifierStartByte(input[startOffset]) {
+	firstRune, ok := lexer.source.Peek()
+	if !ok || !isIdentifierStart(firstRune) {
 		// 非标识符起始字符不能被消费。
 		return "", startPosition, false
 	}
 
-	// 标识符限定 ASCII，直接按 byte 扫描可避免每个字符重复 UTF-8 解码。
-	currentOffset := startOffset + 1
-	for currentOffset < len(input) && isIdentifierPartByte(input[currentOffset]) {
-		// 当前 byte 仍属于标识符，继续前进到第一个非标识符 byte。
-		currentOffset++
+	for {
+		nextRune, available := lexer.source.Peek()
+		if !available || !isIdentifierPart(nextRune) {
+			break
+		}
+		lexer.source.Next()
 	}
-	lexer.source.offset = currentOffset
-	lexer.source.column += currentOffset - startOffset
 
 	// 返回标识符文本和起始位置。
-	return input[startOffset:currentOffset], startPosition, true
+	return input[startOffset:lexer.source.offset], startPosition, true
 }
 
 // isIdentifierStartByte 判断 byte 是否可以作为 Lua 标识符首字符。
@@ -69,26 +71,22 @@ func isIdentifierPartByte(value byte) bool {
 
 // isIdentifierStart 判断 rune 是否可以作为 Lua 标识符首字符。
 //
-// 当前实现按 Lua 5.3 C locale 默认行为处理，只接受 ASCII 字母和下划线。
+// ASCII keeps the common fast test while Unicode letters provide the host
+// extension used by existing Chinese automation scripts.
 func isIdentifierStart(value rune) bool {
-	if value < 0 || value > 0x7f {
-		// 非 ASCII rune 不能作为当前阶段标识符首字符。
-		return false
+	if value >= 0 && value <= 0x7f {
+		return isIdentifierStartByte(byte(value))
 	}
-
-	// ASCII rune 可直接复用 byte 判定逻辑。
-	return isIdentifierStartByte(byte(value))
+	return unicode.IsLetter(value)
 }
 
 // isIdentifierPart 判断 rune 是否可以作为 Lua 标识符非首字符。
 //
-// 标识符后续字符允许 ASCII 字母、数字和下划线。
+// 标识符后续字符允许字母、数字、下划线及 Unicode 组合标记。
 func isIdentifierPart(value rune) bool {
-	if value < 0 || value > 0x7f {
-		// 非 ASCII rune 不能作为当前阶段标识符组成部分。
-		return false
+	if value >= 0 && value <= 0x7f {
+		return isIdentifierPartByte(byte(value))
 	}
-
-	// ASCII rune 可直接复用 byte 判定逻辑。
-	return isIdentifierPartByte(byte(value))
+	return unicode.IsLetter(value) || unicode.IsDigit(value) ||
+		unicode.In(value, unicode.Mn, unicode.Mc, unicode.Pc)
 }
