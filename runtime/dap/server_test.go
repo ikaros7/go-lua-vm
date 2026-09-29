@@ -730,6 +730,98 @@ func TestServerWaitForConfigurationDone(t *testing.T) {
 	}
 }
 
+// TestServerMapsClientPathsAndStopsOnEntry verifies the Android-style remote
+// source path mapping used by editor adapters and the optional first-line stop.
+func TestServerMapsClientPathsAndStopsOnEntry(t *testing.T) {
+	server, connection, reader := startTestServerAndConnect(t)
+	defer server.Close()
+	defer connection.Close()
+
+	writeRequest(t, connection, 1, "initialize")
+	_ = readProtocolMessage(t, reader)
+	_ = readProtocolMessage(t, reader)
+	writeRequestWithArguments(t, connection, 2, "launch", map[string]any{
+		"localRoot": "D:\\workspace", "remoteRoot": "/data/local/tmp/project", "stopOnEntry": true,
+	})
+	_ = readProtocolMessage(t, reader)
+	writeRequestWithArguments(t, connection, 3, "setBreakpoints", map[string]any{
+		"source":      map[string]any{"path": "D:\\workspace\\main.lua"},
+		"breakpoints": []map[string]any{{"line": 2}},
+	})
+	_ = readProtocolMessage(t, reader)
+
+	state := runtime.NewState()
+	defer state.Close()
+	vm := runtime.NewVM(1)
+	proto := &bytecode.Proto{
+		Source:   "@/data/local/tmp/project/main.lua",
+		LineInfo: []int{1, 2}, Code: []bytecode.Instruction{0, 0},
+		LocalVars: []bytecode.LocalVar{{Name: "value", Register: 0, StartPC: 0, EndPC: 2}},
+	}
+	vm.BindPrototype(proto)
+	if err := vm.SetRegister(0, runtime.IntegerValue(42)); err != nil {
+		t.Fatal(err)
+	}
+
+	entryStop := make(chan error, 1)
+	go func() { entryStop <- server.BeforeInstruction(state, vm, proto, 0) }()
+	stopped := readProtocolMessage(t, reader)
+	if stopped["event"] != "stopped" || stopped["body"].(map[string]any)["reason"] != "entry" {
+		t.Fatalf("entry stopped event = %#v", stopped)
+	}
+	writeRequestWithArguments(t, connection, 4, "stackTrace", map[string]any{"threadId": 1})
+	stack := readProtocolMessage(t, reader)
+	frames := stack["body"].(map[string]any)["stackFrames"].([]any)
+	source := frames[0].(map[string]any)["source"].(map[string]any)
+	if source["path"] != "D:/workspace/main.lua" {
+		t.Fatalf("mapped stack source = %#v", source)
+	}
+	writeRequest(t, connection, 5, "continue")
+	_ = readProtocolMessage(t, reader)
+	if err := <-entryStop; err != nil {
+		t.Fatal(err)
+	}
+
+	breakpointStop := make(chan error, 1)
+	go func() { breakpointStop <- server.BeforeInstruction(state, vm, proto, 1) }()
+	stopped = readProtocolMessage(t, reader)
+	if stopped["body"].(map[string]any)["reason"] != "breakpoint" {
+		t.Fatalf("breakpoint stopped event = %#v", stopped)
+	}
+	writeRequest(t, connection, 6, "continue")
+	_ = readProtocolMessage(t, reader)
+	if err := <-breakpointStop; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestServerTerminationAndDisconnect verifies the host can announce normal
+// script completion and wait for the editor to close the DAP session.
+func TestServerTerminationAndDisconnect(t *testing.T) {
+	server, connection, reader := startTestServerAndConnect(t)
+	defer server.Close()
+	defer connection.Close()
+	writeRequest(t, connection, 1, "initialize")
+	_ = readProtocolMessage(t, reader)
+	_ = readProtocolMessage(t, reader)
+
+	server.NotifyTerminated()
+	event := readProtocolMessage(t, reader)
+	if event["event"] != "terminated" {
+		t.Fatalf("terminated event = %#v", event)
+	}
+	waiting := make(chan error, 1)
+	go func() { waiting <- server.WaitForClientDisconnect(context.Background(), time.Second) }()
+	writeRequest(t, connection, 2, "disconnect")
+	response := readProtocolMessage(t, reader)
+	if response["command"] != "disconnect" || response["success"] != true {
+		t.Fatalf("disconnect response = %#v", response)
+	}
+	if err := <-waiting; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // startTestServerAndConnect 启动测试 DAP server 并建立 TCP 连接。
 func startTestServerAndConnect(t *testing.T) (*Server, net.Conn, *bufio.Reader) {
 	t.Helper()

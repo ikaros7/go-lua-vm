@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -40,6 +41,7 @@ type Server struct {
 	mu                   sync.Mutex
 	breakpoints          map[string]map[int]bool
 	activeSession        *connectionSession
+	clientDisconnected   chan struct{}
 	continueCh           chan struct{}
 	configuredCh         chan struct{}
 	configOnce           sync.Once
@@ -52,6 +54,9 @@ type Server struct {
 	threadIDs            map[*runtime.Thread]int
 	nextThreadID         int
 	sourceRoot           string
+	localRoot            string
+	remoteRoot           string
+	stopOnEntry          bool
 	stepMode             dapStepMode
 	stepSource           string
 	stepLine             int
@@ -166,6 +171,38 @@ func (server *Server) Close() error {
 		}
 	})
 	return closeErr
+}
+
+// NotifyTerminated informs the active DAP client that the debuggee finished.
+func (server *Server) NotifyTerminated() {
+	server.mu.Lock()
+	session := server.activeSession
+	server.mu.Unlock()
+	if session == nil {
+		return
+	}
+	session.write(eventMessage{Seq: session.nextSeq(), Type: "event", Event: "terminated"})
+}
+
+// WaitForClientDisconnect keeps the server alive long enough for the client to
+// acknowledge termination and close the DAP session.
+func (server *Server) WaitForClientDisconnect(ctx context.Context, timeout time.Duration) error {
+	server.mu.Lock()
+	disconnected := server.clientDisconnected
+	server.mu.Unlock()
+	if disconnected == nil {
+		return errors.New("GLua DAP client is not connected")
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-disconnected:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("timeout waiting for GLua DAP client disconnect after %s", timeout)
+	}
 }
 
 // acceptLoop 接受 DAP 客户端连接。
@@ -284,7 +321,7 @@ func (server *Server) handleConnection(ctx context.Context, connection net.Conn)
 	defer connection.Close()
 	reader := bufio.NewReader(connection)
 	writer := bufio.NewWriter(connection)
-	session := &connectionSession{writer: writer, server: server}
+	session := &connectionSession{connection: connection, writer: writer, server: server}
 	server.setActiveSession(session)
 	defer server.clearActiveSession(session)
 	for {
@@ -315,6 +352,7 @@ func (server *Server) setActiveSession(session *connectionSession) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	server.activeSession = session
+	server.clientDisconnected = make(chan struct{})
 }
 
 // clearActiveSession 在连接结束时清理活动会话。
@@ -326,6 +364,10 @@ func (server *Server) clearActiveSession(session *connectionSession) {
 	if server.activeSession == session {
 		// 只有当前连接仍是活动会话时才清理，避免覆盖新连接。
 		server.activeSession = nil
+		if server.clientDisconnected != nil {
+			close(server.clientDisconnected)
+			server.clientDisconnected = nil
+		}
 	}
 	if server.stopped {
 		// 客户端断开时解除暂停，避免 CLI 无法退出。
@@ -341,10 +383,12 @@ func (server *Server) clearActiveSession(session *connectionSession) {
 //
 // DAP 要求 adapter 自己递增 seq；该结构避免多个连接共享序列导致测试不稳定。
 type connectionSession struct {
-	mu     sync.Mutex
-	writer *bufio.Writer
-	server *Server
-	nextID int
+	mu         sync.Mutex
+	closeOnce  sync.Once
+	connection net.Conn
+	writer     *bufio.Writer
+	server     *Server
+	nextID     int
 }
 
 // respond 根据请求命令写出 DAP response，并在 initialize 后发送 initialized 事件。
@@ -397,6 +441,9 @@ func (session *connectionSession) respond(request protocolMessage) {
 		Command:    request.Command,
 		Body:       body,
 	})
+	if request.Command == "disconnect" || request.Command == "terminate" {
+		session.close()
+	}
 	if request.Command == "initialize" {
 		// initialized 事件通知客户端可以继续发送断点和 configurationDone。
 		session.write(eventMessage{
@@ -405,6 +452,14 @@ func (session *connectionSession) respond(request protocolMessage) {
 			Event: "initialized",
 		})
 	}
+}
+
+func (session *connectionSession) close() {
+	session.closeOnce.Do(func() {
+		if session.connection != nil {
+			_ = session.connection.Close()
+		}
+	})
 }
 
 // nextSeq 返回当前 DAP 连接的下一个 adapter 序列号。
@@ -448,6 +503,7 @@ func (session *connectionSession) responseBody(request protocolMessage) (any, bo
 		}, true
 	case "launch", "attach":
 		// 当前阶段 launch/attach 都只完成协议握手，脚本执行仍由 CLI 主流程承担。
+		session.server.configureClient(request.Arguments)
 		return map[string]any{}, true
 	case "configurationDone":
 		// 客户端断点配置完成，释放 CLI 去执行脚本。
@@ -502,6 +558,22 @@ func (session *connectionSession) responseBody(request protocolMessage) (any, bo
 		// 未列出的命令一律按未实现处理。
 		return nil, false
 	}
+}
+
+func (server *Server) configureClient(arguments json.RawMessage) {
+	var request struct {
+		LocalRoot   string `json:"localRoot"`
+		RemoteRoot  string `json:"remoteRoot"`
+		StopOnEntry bool   `json:"stopOnEntry"`
+	}
+	if len(arguments) > 0 {
+		_ = json.Unmarshal(arguments, &request)
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	server.localRoot = canonicalDAPPath(request.LocalRoot)
+	server.remoteRoot = canonicalDAPPath(request.RemoteRoot)
+	server.stopOnEntry = request.StopOnEntry
 }
 
 // markConfigured 标记 DAP 客户端已经完成断点配置。
@@ -649,10 +721,10 @@ func (server *Server) setBreakpoints(arguments json.RawMessage) map[string]any {
 		// DAP 客户端通常发送 source.path 与 breakpoints；解析失败会走空断点响应。
 		_ = json.Unmarshal(arguments, &request)
 	}
-	source := normalizeSourcePath(request.Source.Path, server.sourceRoot)
+	source := server.sourcePathForRuntime(request.Source.Path)
 	if source == "" {
 		// path 缺失时回退 name，兼容少量只传 name 的客户端。
-		source = normalizeSourcePath(request.Source.Name, server.sourceRoot)
+		source = server.sourcePathForRuntime(request.Source.Name)
 	}
 	lineSet := make(map[int]bool)
 	breakpointResults := make([]map[string]any, 0, len(request.Breakpoints)+len(request.Lines))
@@ -732,7 +804,8 @@ func (server *Server) stackTrace(arguments json.RawMessage) map[string]any {
 		entry := map[string]any{"id": index + 1, "name": name, "line": frameLine, "column": 1}
 		if frameSource != "" {
 			// 仅在存在真实 source 时提供跳转目标。
-			entry["source"] = map[string]any{"name": filepath.Base(frameSource), "path": frameSource}
+			frameSource = mapDAPSourcePath(frameSource, server.remoteRoot, server.localRoot)
+			entry["source"] = map[string]any{"name": path.Base(canonicalDAPPath(frameSource)), "path": frameSource}
 		}
 		result = append(result, entry)
 	}
@@ -1297,13 +1370,15 @@ func (server *Server) BeforeInstruction(state *runtime.State, vm *runtime.VM, pr
 		// 非正行号不是用户可见源码行。
 		return nil
 	}
-	source := normalizeSourcePath(proto.Source, server.sourceRoot)
+	source := server.sourcePathForRuntime(normalizeSourcePath(proto.Source, server.sourceRoot))
 	if source == "" {
 		// 缺少源码路径时不能匹配断点或步进。
 		return nil
 	}
 	reason := ""
-	if server.hasBreakpoint(source, line) {
+	if server.consumeEntryStop() {
+		reason = "entry"
+	} else if server.hasBreakpoint(source, line) {
 		// 命中用户设置的断点。
 		reason = "breakpoint"
 	} else if server.consumeStepStop(source, line, state.CallDepth()) {
@@ -1321,6 +1396,16 @@ func (server *Server) BeforeInstruction(state *runtime.State, vm *runtime.VM, pr
 	}
 	thread, _ := state.Running()
 	return server.pauseAt(state, stoppedLocation{Source: source, Line: line, PC: pc, Reason: reason, Variables: variables, VM: vm, Depth: state.CallDepth(), Frames: state.TracebackFrames(), State: state, Thread: thread})
+}
+
+func (server *Server) consumeEntryStop() bool {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if !server.stopOnEntry {
+		return false
+	}
+	server.stopOnEntry = false
+	return true
 }
 
 // consumeStepStop 判断当前 source:line 是否满足步进或 pause 请求。
@@ -1387,7 +1472,9 @@ func (server *Server) hasBreakpoint(source string, line int) bool {
 	}
 	for breakpointSource, lines := range server.breakpoints {
 		// 精确路径或后缀路径匹配都视为同一文件，兼容 CLI 相对路径与 IDE 绝对路径差异。
-		if breakpointSource == source || strings.HasSuffix(source, string(filepath.Separator)+breakpointSource) || strings.HasSuffix(breakpointSource, string(filepath.Separator)+source) {
+		canonicalBreakpoint := canonicalDAPPath(breakpointSource)
+		canonicalSource := canonicalDAPPath(source)
+		if canonicalBreakpoint == canonicalSource || strings.HasSuffix(canonicalSource, "/"+canonicalBreakpoint) || strings.HasSuffix(canonicalBreakpoint, "/"+canonicalSource) {
 			return lines[line]
 		}
 	}
@@ -1447,6 +1534,11 @@ func normalizeSourcePath(source string, baseDir string) string {
 		// 空 source 无法匹配断点。
 		return ""
 	}
+	if portable := canonicalDAPPath(trimmed); strings.HasPrefix(portable, "/") {
+		// Unix and Android absolute paths must remain absolute even when tests or
+		// editor adapters run on Windows.
+		return portable
+	}
 	cleaned := filepath.Clean(trimmed)
 	if filepath.IsAbs(cleaned) {
 		// 绝对路径已经足以让 IDE 定位源码，只需要标准化分隔符与冗余路径段。
@@ -1466,6 +1558,72 @@ func normalizeSourcePath(source string, baseDir string) string {
 		return filepath.Clean(absolutePath)
 	}
 	return cleaned
+}
+
+func canonicalDAPPath(value string) string {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(value, "@"))
+	if trimmed == "" {
+		return ""
+	}
+	return path.Clean(strings.ReplaceAll(trimmed, "\\", "/"))
+}
+
+func relativeDAPPath(value, root string) (string, bool) {
+	value = canonicalDAPPath(value)
+	root = strings.TrimSuffix(canonicalDAPPath(root), "/")
+	if value == "" || root == "" {
+		return "", false
+	}
+	if strings.EqualFold(value, root) {
+		return "", true
+	}
+	prefix := root + "/"
+	if len(value) > len(prefix) && strings.EqualFold(value[:len(prefix)], prefix) {
+		return value[len(prefix):], true
+	}
+	return "", false
+}
+
+func joinDAPPath(root, relative string) string {
+	root = strings.TrimSuffix(canonicalDAPPath(root), "/")
+	relative = strings.TrimPrefix(canonicalDAPPath(relative), "/")
+	if relative == "" || relative == "." {
+		return root
+	}
+	if root == "" {
+		return relative
+	}
+	return root + "/" + relative
+}
+
+func (server *Server) sourcePathForRuntime(source string) string {
+	cleaned := canonicalDAPPath(source)
+	server.mu.Lock()
+	localRoot, remoteRoot := server.localRoot, server.remoteRoot
+	server.mu.Unlock()
+	if mapped := mapDAPSourcePath(cleaned, localRoot, remoteRoot); mapped != cleaned {
+		return mapped
+	}
+	if cleaned != "" && remoteRoot != "" && !strings.Contains(cleaned, ":/") && !strings.HasPrefix(cleaned, "/") {
+		return joinDAPPath(remoteRoot, cleaned)
+	}
+	return source
+}
+
+func (server *Server) sourcePathForClient(source string) string {
+	cleaned := canonicalDAPPath(source)
+	server.mu.Lock()
+	localRoot, remoteRoot := server.localRoot, server.remoteRoot
+	server.mu.Unlock()
+	return mapDAPSourcePath(cleaned, remoteRoot, localRoot)
+}
+
+func mapDAPSourcePath(source, fromRoot, toRoot string) string {
+	cleaned := canonicalDAPPath(source)
+	if relative, ok := relativeDAPPath(cleaned, fromRoot); ok && canonicalDAPPath(toRoot) != "" {
+		return joinDAPPath(toRoot, relative)
+	}
+	return source
 }
 
 // valueTypeName 返回 DAP 变量展示使用的 Lua 类型名称。
