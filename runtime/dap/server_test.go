@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ZingYao/go-lua-vm/bytecode"
+	glua "github.com/ZingYao/go-lua-vm/lua"
 	"github.com/ZingYao/go-lua-vm/runtime"
 )
 
@@ -804,6 +805,64 @@ func TestInstructionSourcePathInheritsRootPrototypeSource(t *testing.T) {
 	}
 	if got := instructionSourcePath(child, frames, "/ignored"); got != "/data/local/tmp/project/main.lua" {
 		t.Fatalf("instructionSourcePath() = %q", got)
+	}
+}
+
+func TestServerStopsInsideCompiledNestedFunction(t *testing.T) {
+	server, connection, reader := startTestServerAndConnect(t)
+	defer server.Close()
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	writeRequest(t, connection, 1, "initialize")
+	_ = readProtocolMessage(t, reader)
+	_ = readProtocolMessage(t, reader)
+	writeRequestWithArguments(t, connection, 2, "launch", map[string]any{
+		"localRoot": "D:\\workspace", "remoteRoot": "/data/local/tmp/project", "stopOnEntry": true,
+	})
+	_ = readProtocolMessage(t, reader)
+	writeRequestWithArguments(t, connection, 3, "setBreakpoints", map[string]any{
+		"source":      map[string]any{"path": "D:\\workspace\\main.lua"},
+		"breakpoints": []map[string]any{{"line": 6}},
+	})
+	_ = readProtocolMessage(t, reader)
+
+	options := glua.DefaultOptions()
+	options.DebugObserver = server
+	state := glua.NewStateWithOptions(options)
+	defer state.Close()
+	source := "GLOBAL_STATE = { mode = \"debug\" }\nlocal function calculate(input)\n  local value = input\n  local tools = { name = \"lua\", nested = { count = 2 } }\n  value = value + tools.nested.count\n  return value\nend\nlocal result = calculate(40)\n"
+	done := make(chan error, 1)
+	go func() {
+		if err := glua.LoadString(state, source, "@/data/local/tmp/project/main.lua"); err != nil {
+			done <- err
+			return
+		}
+		closure, err := state.Pop()
+		if err == nil {
+			_, err = glua.Call(state, closure)
+		}
+		done <- err
+	}()
+	entry := readProtocolMessage(t, reader)
+	if entry["body"].(map[string]any)["reason"] != "entry" {
+		t.Fatalf("entry event = %#v", entry)
+	}
+	writeRequest(t, connection, 4, "continue")
+	_ = readProtocolMessage(t, reader)
+	nested := readProtocolMessage(t, reader)
+	if nested["event"] != "stopped" || nested["body"].(map[string]any)["reason"] != "breakpoint" {
+		t.Fatalf("nested stop event = %#v", nested)
+	}
+	writeRequestWithArguments(t, connection, 5, "stackTrace", map[string]any{"threadId": 1})
+	stack := readProtocolMessage(t, reader)
+	frames := stack["body"].(map[string]any)["stackFrames"].([]any)
+	if len(frames) < 2 || frames[0].(map[string]any)["line"] != float64(6) {
+		t.Fatalf("nested stack = %#v", stack)
+	}
+	writeRequest(t, connection, 6, "continue")
+	_ = readProtocolMessage(t, reader)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

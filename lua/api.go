@@ -3808,6 +3808,7 @@ func executeLuaCallRequest(state *State, vm *runtime.VM, proto *bytecode.Proto, 
 		return runtime.ErrRegisterOutOfRange
 	}
 	gluaEventsEnabled := gluaHasAnyEvent(state)
+	debugObserverEnabled := ((*runtime.State)(state)).Options().DebugObserver != nil
 	var results []Value
 	var directCallVM *runtime.VM
 	directResultsWritten := false
@@ -3874,7 +3875,7 @@ func executeLuaCallRequest(state *State, vm *runtime.VM, proto *bytecode.Proto, 
 		// 固定参数/固定返回的 Lua closure 走 direct CALL，避免构造参数切片。
 		results, directCallVM, directResultsWritten, err = executeLuaCallRequestDirect(state, vm, directClosure, debugName, debugNameWhat, callRequest)
 	} else {
-		if !hooksEnabled && !coroutinesCreated && !gluaEventsEnabled && functionValue.Kind == runtime.KindLuaClosure {
+		if !hooksEnabled && !coroutinesCreated && !gluaEventsEnabled && !debugObserverEnabled && functionValue.Kind == runtime.KindLuaClosure {
 			// 无 hook、无 coroutine 的普通主线程路径可尝试固定签名自递归 fast path；不命中时回退完整 CALL。
 			if selfRecursiveClosure, ok := functionValue.Ref.(*runtime.LuaClosure); ok && selfRecursiveClosure.SelfRecursiveIntegerFib {
 				if contextErr := state.CheckContext(); contextErr != nil {
@@ -4192,6 +4193,11 @@ func canExecuteLuaCallRequestDirect(state *State, functionValue Value, callReque
 	}
 	if gluaEventsEnabled {
 		// glua events 需要完整调用帧与生命周期事件，不能走隐藏 Lua closure 的 direct CALL。
+		return nil, false
+	}
+	if ((*runtime.State)(state)).Options().DebugObserver != nil {
+		// VM observers need the complete Lua execution loop for instruction
+		// callbacks, local registers, and visible nested call frames.
 		return nil, false
 	}
 	if functionValue.Kind != runtime.KindLuaClosure {
