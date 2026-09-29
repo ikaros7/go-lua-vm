@@ -795,6 +795,18 @@ func TestServerMapsClientPathsAndStopsOnEntry(t *testing.T) {
 	}
 }
 
+func TestInstructionSourcePathInheritsRootPrototypeSource(t *testing.T) {
+	child := &bytecode.Proto{}
+	root := &bytecode.Proto{Source: "@/data/local/tmp/project/main.lua"}
+	frames := []runtime.CallFrame{
+		{Kind: runtime.CallFrameKindLua, Function: runtime.ReferenceValue(runtime.KindLuaClosure, &runtime.LuaClosure{Proto: child})},
+		{Kind: runtime.CallFrameKindLua, Function: runtime.ReferenceValue(runtime.KindLuaClosure, &runtime.LuaClosure{Proto: root})},
+	}
+	if got := instructionSourcePath(child, frames, "/ignored"); got != "/data/local/tmp/project/main.lua" {
+		t.Fatalf("instructionSourcePath() = %q", got)
+	}
+}
+
 // TestServerTerminationAndDisconnect verifies the host can announce normal
 // script completion and wait for the editor to close the DAP session.
 func TestServerTerminationAndDisconnect(t *testing.T) {

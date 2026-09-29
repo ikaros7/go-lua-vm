@@ -1370,7 +1370,8 @@ func (server *Server) BeforeInstruction(state *runtime.State, vm *runtime.VM, pr
 		// 非正行号不是用户可见源码行。
 		return nil
 	}
-	source := server.sourcePathForRuntime(normalizeSourcePath(proto.Source, server.sourceRoot))
+	frames := state.TracebackFrames()
+	source := server.sourcePathForRuntime(instructionSourcePath(proto, frames, server.sourceRoot))
 	if source == "" {
 		// 缺少源码路径时不能匹配断点或步进。
 		return nil
@@ -1395,7 +1396,31 @@ func (server *Server) BeforeInstruction(state *runtime.State, vm *runtime.VM, pr
 		variables = vm.ActiveLocalSnapshots()
 	}
 	thread, _ := state.Running()
-	return server.pauseAt(state, stoppedLocation{Source: source, Line: line, PC: pc, Reason: reason, Variables: variables, VM: vm, Depth: state.CallDepth(), Frames: state.TracebackFrames(), State: state, Thread: thread})
+	return server.pauseAt(state, stoppedLocation{Source: source, Line: line, PC: pc, Reason: reason, Variables: variables, VM: vm, Depth: state.CallDepth(), Frames: frames, State: state, Thread: thread})
+}
+
+// instructionSourcePath resolves stripped child-prototype sources from the
+// nearest Lua caller. Lua bytecode commonly stores a source only on the root
+// prototype, while nested functions inherit it implicitly.
+func instructionSourcePath(proto *bytecode.Proto, frames []runtime.CallFrame, sourceRoot string) string {
+	if proto != nil {
+		if source := normalizeSourcePath(proto.Source, sourceRoot); source != "" {
+			return source
+		}
+	}
+	for _, frame := range frames {
+		if frame.Function.Kind != runtime.KindLuaClosure {
+			continue
+		}
+		closure, _ := frame.Function.Ref.(*runtime.LuaClosure)
+		if closure == nil || closure.Proto == nil {
+			continue
+		}
+		if source := normalizeSourcePath(closure.Proto.Source, sourceRoot); source != "" {
+			return source
+		}
+	}
+	return ""
 }
 
 func (server *Server) consumeEntryStop() bool {
