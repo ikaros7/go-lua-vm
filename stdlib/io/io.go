@@ -1568,7 +1568,7 @@ func readOne(file *File, format runtime.Value, functionName string) ([]runtime.V
 				return nil, runtime.RaiseError(runtime.StringValue(err.Error()))
 			}
 			return []runtime.Value{runtime.StringValue(line)}, nil
-		case "*a", "a", "all":
+		case "*a", "a", "all", "*all":
 			// 全量模式读取剩余内容。
 			content, err := file.ReadAll()
 			if err != nil {

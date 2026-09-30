@@ -332,6 +332,18 @@ func TestFileOperationErrorsBecomeLuaErrors(t *testing.T) {
 	}
 }
 
+// TestFileReadLegacyAllFormat covers the format used by older Lua scripts.
+func TestFileReadLegacyAllFormat(t *testing.T) {
+	file := NewFile("legacy", strings.NewReader("hello\n"), nil, nil, nil)
+	got, err := FileRead(NewFileValue(nil, file), runtime.StringValue("*all"))
+	if err != nil {
+		t.Fatalf("file:read(*all) failed: %v", err)
+	}
+	if len(got) != 1 || got[0].String != "hello\n" {
+		t.Fatalf("file:read(*all) = %#v, want full content", got)
+	}
+}
+
 // TestReadReadsDefaultInput 验证 io.read 从默认输入按格式读取。
 //
 // 该用例覆盖默认行读取、指定字节读取和全量读取，避免依赖真实 stdin。
